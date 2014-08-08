@@ -1,4 +1,5 @@
-// MIMO + OFDM
+// 0728~
+// MIMO + vblast
 // C.W
 //
 #include <itpp/itcomm.h>
@@ -10,16 +11,15 @@ int main(int argc,char **argv) {
     int nC;                    // type of constellation  (1=QPSK, 2=16-QAM, 3=64-QAM)
     int nRx;                   // number of receive antennas
     int nTx;                   // number of transmit antennas
-//    int Tc = 512;              // symbol durations, multiple of T, T<=coherence_time<=tx_duration, T is the ST code duration
-    int nb_iter = 5;
+    int channel_uses = 1;
     string map_metric = "maxlogMAP";
-    string code_name = "Alamouti_2xN";
-    string demapper_method = "Alamouti_maxlogMAP";
+    string code_name = "V-BLAST_MxN";
+    string demapper_method = "zfPIC";  // zfPIC, Hassibi_maxlogMAP
     ivec gen = "0133 0165 0171";
     int constraint_len = 7;
     double rate = 1.0 / 3.0;
-    const vec EbN0db = "-5:1:5";           // SNR range
-    const int Nbits = int(1e6);           // number of bits to ever simulate per SNR point
+    const vec EbN0db = "-5:2:15";           // SNR range
+    const int Nbits = int(1e3);           // number of bits to ever simulate per SNR point
     
     if (argc != 4) {
         cout << "Usage: ./mimo nTx nRx nC" << endl << "Example: ./mimo 2 2 1" << endl;
@@ -36,19 +36,22 @@ int main(int argc,char **argv) {
     chan.set_M(1, 1 << (2*nC));
     
     AWGN_Channel awgn;
-
+    
     // -- STC --
-    STC stc(code_name, 1 << (2*nC));
+    STC stc(code_name, 1 << (2*nC), nTx, channel_uses);
     nTx = stc.get_nb_emission_antenna();
-    const int channel_uses = stc.get_channel_uses();
+    channel_uses = stc.get_channel_uses();
     const int symb_block = stc.get_nb_symbols_per_block();
     
     // -- Convolutional code parameters --
     Convolutional_Code code;
     code.set_generator_polynomials(gen, constraint_len);
-    bvec dummy;
-    code.encode(randb(Nbits), dummy);
-    const int Nc = length(dummy);
+    bvec dummy, dummy2;
+   // code.encode(randb(Nbits), dummy);
+   // const int Nc = length(dummy);
+   // const int Nctx = (int)(2 * nC * symb_block * ceil(double(Nc) / double(2 * nC * symb_block)));
+    code.encode(randb(Nbits/nTx), dummy2);
+    const int Nc = length(dummy2);
     const int Nctx = (int)(2 * nC * symb_block * ceil(double(Nc) / double(2 * nC * symb_block)));
     
     // -- SISO demapper --
@@ -59,30 +62,11 @@ int main(int argc,char **argv) {
     siso.set_demapper_method(demapper_method);
     siso.set_st_block_code(stc.get_nb_symbols_per_block(), stc.get_1st_gen_matrix(), stc.get_2nd_gen_matrix(), nRx);
     
-    // -- SISO decoder --
-    vec dem_extridata(Nctx);
-    vec dem_apriodata(Nctx);
-    dem_apriodata.zeros();
-    
-    vec nsc_intrinsic_coded(Nctx);
-	vec nsc_apriori_data(Nbits);
-	nsc_apriori_data.zeros();
-	vec nsc_extrinsic_coded(Nctx);
-	vec nsc_extrinsic_data(Nbits);
-    
-    
-    // -- ofdm modulation --
-    const int Nfft = 1024; // 1024
-    const int Ncp = 128;  // 128, 1/8 of the FFT size
-    OFDM ofdm;
-    ofdm.set_parameters(Nfft,Ncp);
-
     RNG_randomize();
     
     BPSK bpsk;
     BERC berc;
     vec ber(EbN0db.length());
-    bvec rec_bits(Nbits);
     
     cout.setf(ios::fixed, ios::floatfield);
     cout.setf(ios::showpoint);
@@ -90,7 +74,7 @@ int main(int argc,char **argv) {
     
     // ================== Run simulation =======================
     for (int nsnr = 0; nsnr < length(EbN0db); nsnr++) {
-        cout << " --------- Run " << nsnr << " time -------- " << endl;
+ //       cout << " --------- Run " << nsnr << " time -------- " << endl;
         const double Eb = 1.0;      // transmitted energy per information bit
         const double N0 = inv_dB(-EbN0db(nsnr));
         const double sigma2 = N0;   // Variance of each scalar complex noise sample
@@ -99,68 +83,80 @@ int main(int argc,char **argv) {
         
         awgn.set_noise(N0);
         siso.set_noise(N0 / 2);
-            
+        
         // -- generate and encode random data --
         bvec inputbits = randb(Nbits);
-        bvec txbits = code.encode_tail(inputbits);
-
-        // -- mapping --
-        if (Nc != Nctx) {
-            txbits = concat(txbits, randb(Nctx - Nc));
-        }
-        const int Nmap = Nctx / (2 * nC);  // length of complex symbols after mapping
-        cvec inputsymbol(Nmap);
-        for (int k = 0; k < Nmap; k++) {
-            bvec bitstmp = txbits(k * (2 * nC), (k + 1) * (2 * nC) - 1);
-            inputsymbol.set_subvector(k, chan.modulate_bits(bitstmp));
+        bmat bits_tx = reshape(inputbits, nTx, Nbits / nTx).transpose();
+        bmat txbits(Nctx, nTx);
+        for (int i = 0; i < nTx; i++) {
+           txbits.set_col(i,code.encode(bits_tx.get_col(i)));
         }
         
+        // -- mapping --
+        if (Nc != Nctx) {
+            int add = Nctx - Nc;
+            for (int i = 0; i < add; i++)
+                txbits.append_row(randb(nTx));
+        }
+        const int Nmap = Nctx / (2 * nC) * nTx;  // length of complex symbols after mapping
+        const int Nm = Nctx / (2 * nC); // length of complex symbols per antenna after mapping
+        cvec inputsymbol(Nmap);
+        for (int k = 0; k < Nm; k++) {
+            for (int i = 0; i < nTx; i++) {
+                bvec bitstmp = txbits.get_col(i)(k*2*nC,(k+1)*2*nC-1);
+                inputsymbol.set_subvector(k*nTx+i, chan.modulate_bits(bitstmp));
+            }
+        }
         // -- STC --
         const int Ns = Nmap / symb_block * channel_uses; // length of complex symbols after stc for each antenna
         cmat symbol_stc = stc.encode(inputsymbol);
-
         
-        // -- IFFT --
-        const int Nf = (Ns / Nfft + 1) * Nfft; // length of complex symbols, multiple of fft
-        int add;
-        if (Ns % Nfft != 0) {
-            add = Nf - Ns;
-            cvec addzeros = zeros_c(symb_block);
-            for (int i = 0; i < add; i++)
-                symbol_stc.append_row(addzeros);
-        }
-        cmat txsymbol(Nf / Nfft * (Nfft + Ncp), symb_block); // complex transmitted data after ifft and cp; will pass through channel
-        for (int k = 0; k < nTx; k++) {
-            txsymbol.set_col(k, ofdm.modulate(symbol_stc.get_col(k)));
-        }
-  
+        
         // -- generate channel and data ----
-        const int tx_duration = txsymbol.rows();
-        cmat H(nTx * nRx, tx_duration) ;
-        H.ones();
+        const int tx_duration = symbol_stc.rows();
+        cmat H(nTx * nRx, tx_duration);
+    //    H.ones();
+    //    H *= sqrt(Es);
+        H = randn_c(nTx * nRx, tx_duration);
         H *= sqrt(Es);
+        cmat Y(tx_duration, nRx); 
         
-        siso.set_impulse_response(H);
-        cmat Y(tx_duration, nRx);
-        
-        for (int i = 0; i < tx_duration / channel_uses; i++ ) {  // Y = Hx + n
-            Y.set_submatrix(i * channel_uses, 0, txsymbol(i * channel_uses, (i+1) * channel_uses - 1, 0, nTx - 1) * reshape(H.get_col(i), nTx, nRx));
+        for (int i = 0; i < tx_duration / channel_uses; i++ ) {  // Y = Hx + n  
+          Y.set_submatrix(i * channel_uses, 0, symbol_stc(i * channel_uses, (i+1) * channel_uses - 1, 0, nTx - 1) * reshape(H.get_col(i), nTx, nRx));
         }
         Y = awgn(Y);
         
-        // -- FFT and demodulate --
-        cmat rxsymbol(Nf, symb_block);  // complex received data after fft
-        for (int k = 0; k < nRx; k++) {
-            rxsymbol.set_col(k, ofdm.demodulate(Y.get_col(k)));
-        }
-        rxsymbol.del_rows(Nf - add, Nf - 1); // extra adds before to meet multiple of fft
+        siso.set_impulse_response(H);
 
-        siso.demapper(dem_extridata, rxsymbol, dem_apriodata);
-        nsc_intrinsic_coded = dem_extridata;
-            
-        siso.nsc(nsc_extrinsic_coded, nsc_extrinsic_data, nsc_intrinsic_coded, nsc_apriori_data);
-        rec_bits = bpsk.demodulate_bits(-nsc_extrinsic_data);
-            
+
+        // -- SISO decoder --
+        vec dem_extridata(Nctx * nTx);
+        vec dem_apriodata(Nctx * nTx);
+        dem_apriodata.zeros();
+        
+        //vec nsc_intrinsic_coded(Nctx * nTx);
+        mat nsc_intrinsic_coded(Nctx, nTx);
+        vec nsc_apriori_data(Nbits / nTx);
+        nsc_apriori_data.zeros();
+        vec nsc_extrinsic_coded(Nctx);
+        vec nsc_extrinsic_data(Nbits / nTx);
+        mat data(Nbits / nTx, nTx);
+        vec rec_data(Nbits);
+        bvec rec_bits(Nbits);
+
+        siso.demapper(dem_extridata, Y, dem_apriodata);
+        
+        for (int i = 0; i < Nm; i++) {
+            nsc_intrinsic_coded.set_submatrix(i*2*nC, 0, reshape(dem_extridata(i*2*nC*nTx, (i+1)*2*nC*nTx -1), 2*nC, nTx));
+        }
+        
+        for (int k = 0; k < nTx; k++) {
+            siso.nsc(nsc_extrinsic_coded, nsc_extrinsic_data, nsc_intrinsic_coded.get_col(k), nsc_apriori_data);
+            data.set_col(k, nsc_extrinsic_data);
+        }
+        rec_data = rvectorize(data);
+        rec_bits = bpsk.demodulate_bits(-rec_data);
+        
         berc.clear();
         berc.count(inputbits, rec_bits);
         ber(nsnr) = berc.get_errorrate();
